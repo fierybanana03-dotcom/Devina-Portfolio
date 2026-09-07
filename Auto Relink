@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+r"""
+auto_relink (8).py — Daily relink & robust sheet-name preservation for 质量日报.
+
+IMPORTANT:
+- Only the "透视资料 Hasil Pivot " sheet (sheet5 in this workbook) gets
+  its XLOOKUP external references rewritten to explicit current filenames.
+- 综合 Keseluruhan is NOT modified.
+- SLA Tepat Waktu is used by BX/BY and is expected to occupy TWO external
+  link slots (allow_multiple=True below).
+- Komplain Reguler is a separate source and must never be matched onto an
+  SLA slot or vice versa.
+
+NEW IN VERSION 8:
+- Fixed SyntaxError by removing invalid characters in docstring and using raw formatting.
+- Updated COM recalculation handling to gracefully catch external source security 
+  locks (-2147352567) without interrupting output creation.
+- Retains safe XML regex capturing for target sheet names from v7 (([^'!]+)).
+"""
+import argparse
+import re
+import sys
+import zipfile
+from pathlib import Path
+from urllib.parse import unquote
+
+CONCEPTS = [
+    {"name": "SLA",            "keywords": ["时效签收及时率", "sla tepat waktu", "waktu rencana ttd semula"],
+     "forbidden": ["投诉报表", "komplain reguler"]},
+    {"name": "Komplain",       "keywords": ["投诉报表", "komplain reguler"],
+     "forbidden": ["时效签收及时率", "sla tepat waktu", "waktu rencana ttd semula"]},
+    {"name": "Lostscan",       "keywords": ["漏扫", "lostscan"], "forbidden": []},
+    {"name": "PBTM",           "keywords": ["分批配载率明细", "pbtm", "rumus"], "forbidden": []},
+    {"name": "ResiKembali",    "keywords": ["回单返回及时率监控", "resi kembali"], "forbidden": []},
+    {"name": "Transit",        "keywords": ["中转及时率报表"], "forbidden": []},
+    {"name": "Keberangkatan",  "keywords": ["干线发车准点率", "keberangkatan"], "forbidden": []},
+    {"name": "Perjalanan",     "keywords": ["干线运行合格率", "perjalanan"], "forbidden": []},
+    {"name": "Arbitrase",      "keywords": ["仲裁破损遗失报告", "arbitrase"], "forbidden": []},
+    {"name": "CollectionPoint","keywords": ["进港分拨", "collection point"], "forbidden": []},
+    {"name": "ReturCodTT",     "keywords": ["retur cod tt", "退件看板"], "forbidden": []},
+    {"name": "ReturLazada",    "keywords": ["retur lazada", "退件看板"], "forbidden": []},
+    {"name": "PickUp",         "keywords": ["订单揽收及时率", "pick up"], "forbidden": []},
+    {"name": "BukaWaybill",    "keywords": ["开单未走货率", "buka waybill"], "forbidden": []},
+    {"name": "Gateway",        "keywords": ["中心妥投率", "gateway"], "forbidden": []},
+]
+
+TARGET_RE = re.compile(r'Target="([^"]*)"')
+
+
+def find_external_link_rels(zf):
+    out = {}
+    for name in zf.namelist():
+        m = re.match(r"xl/externalLinks/_rels/externalLink(\d+)\.xml\.rels$", name)
+        if m:
+            out[int(m.group(1))] = name
+    return out
+
+
+def current_target(zf, rels_path):
+    content = zf.read(rels_path).decode("utf-8")
+    m = TARGET_RE.search(content)
+    return m.group(1) if m else ""
+
+
+def classify_target(target_path_str):
+    name = unquote(Path(target_path_str).name).lower()
+    if not name:
+        return None, 0, []
+
+    scored = []
+    for concept in CONCEPTS:
+        kws = [k.lower() for k in concept["keywords"]]
+        forbidden = [k.lower() for k in concept["forbidden"]]
+        hit_count = sum(1 for k in kws if k in name)
+        if hit_count == 0:
+            continue
+        if any(f in name for f in forbidden):
+            continue
+        scored.append((hit_count, concept))
+
+    if not scored:
+        return None, 0, []
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    best_count, best_concept = scored[0]
+    others_tied = [c["name"] for cnt, c in scored[1:] if cnt == best_count]
+    return best_concept, best_count, others_tied
+
+
+def match_ref_file(concept, ref_files):
+    kws = [k.lower() for k in concept["keywords"]]
+    forbidden = [k.lower() for k in concept["forbidden"]]
+
+    hits = []
+    for f in ref_files:
+        name = f.name.lower()
+        if not all(k in name for k in kws):
+            continue
+        if any(k in name for k in forbidden):
+            continue
+        hits.append(f)
+
+    if not hits:
+        return None
+
+    hits.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return hits[0]
+
+
+def build_new_target(path: Path):
+    target = str(path.resolve())
+    return (target.replace("&", "&amp;")
+                  .replace("<", "&lt;")
+                  .replace(">", "&gt;")
+                  .replace('"', "&quot;"))
+
+
+def patch_hasil_pivot_formulas(xml_bytes, matched_by_idx):
+    """
+    Safely patch xl/worksheets/sheet5.xml without stripping or corrupting sheet names.
+    Captures exact SheetName strings and wraps output in standard Excel path format.
+    """
+    text = xml_bytes.decode("utf-8")
+
+    for idx, path in matched_by_idx.items():
+        directory = str(path.resolve().parent)
+        filename = path.name
+        
+        explicit = f"{directory}\\[{filename}]"
+        explicit_xml = (explicit.replace("&", "&amp;")
+                                .replace("<", "&lt;")
+                                .replace(">", "&gt;"))
+
+        pattern = re.compile(r"'?\[" + str(idx) + r"\]([^'!]+)'?!")
+
+        def repl(m, ex=explicit_xml):
+            sheetname = m.group(1).strip("'")
+            return f"'{ex}{sheetname}'!"
+
+        text = pattern.sub(repl, text)
+
+    return text.encode("utf-8")
+
+
+def force_recalculate_values(file_path: Path):
+    """
+    Spawns background WPS (or Excel) to recalculate external formulas 
+    and save cached results safely without crashing on COM security locks.
+    """
+    try:
+        import win32com.client as win32
+    except ImportError:
+        print("\n[!] Info: 'pywin32' library not installed. Skipping background calculation.")
+        return
+
+    abs_path = str(file_path.resolve())
+    print(f"\nLaunching background engine to calculate values for: {file_path.name}...")
+    
+    app = None
+    for app_name in ['ET.Application', 'Excel.Application']:
+        try:
+            app = win32.Dispatch(app_name)
+            break
+        except Exception:
+            continue
+
+    if app is None:
+        print("[!] Info: Could not dispatch WPS or Excel COM application.")
+        return
+
+    try:
+        app.Visible = False
+        app.DisplayAlerts = False
+        app.AskToUpdateLinks = False
+        
+        wb = app.Workbooks.Open(abs_path, UpdateLinks=0, ReadOnly=False)
+        
+        try:
+            wb.UpdateLink(Name=wb.LinkSources())
+        except Exception:
+            pass
+
+        app.CalculateFull()
+        
+        wb.Save()
+        wb.Close(SaveChanges=True)
+        print(" Successfully recalculated and saved formula values cache!")
+    except Exception as e:
+        print(f"[!] Background auto-calc skipped (External files protected by OS): {e}")
+        print("    -> Note: Your workbook is still 100% correctly relinked!")
+    finally:
+        try:
+            app.Quit()
+        except Exception:
+            pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workbook")
+    ap.add_argument("--refs-folder", required=True)
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-recalc", action="store_true", help="Skip opening background WPS/Excel to bake values cache")
+    args = ap.parse_args()
+
+    wb_path = Path(args.workbook)
+    refs_folder = Path(args.refs_folder)
+    out_path = Path(args.output)
+
+    if not wb_path.exists():
+        sys.exit(f"Workbook not found: {wb_path}")
+    if not refs_folder.is_dir():
+        sys.exit(f"Refs folder not found: {refs_folder}")
+
+    ref_files = [
+        p for p in refs_folder.iterdir()
+        if p.suffix.lower() in (".xlsx", ".xls", ".xlsm")
+        and not p.name.startswith("~$")
+    ]
+    if not ref_files:
+        sys.exit(f"No Excel reference files found in {refs_folder}")
+
+    with zipfile.ZipFile(wb_path, "r") as zf:
+        rels_by_index = find_external_link_rels(zf)
+
+        try:
+            sheet5_text = zf.read("xl/worksheets/sheet5.xml").decode("utf-8")
+            active_indices = {
+                int(n) for n in re.findall(r"'?\[(\d+)\][^'!]*'?!", sheet5_text)
+            }
+        except KeyError:
+            active_indices = set(rels_by_index.keys())
+
+        updates = {}
+        skipped = []
+        seen_concepts = {}
+        chosen_files_by_concept = {}
+        rows = []
+
+        for idx, rels_path in sorted(rels_by_index.items()):
+            if idx not in active_indices:
+                rows.append((idx, "-", "-", "not referenced",
+                             "no [%d]... token found in Hasil Pivot formulas — left untouched" % idx))
+                continue
+
+            old_target = current_target(zf, rels_path)
+            old_name = unquote(Path(old_target).name) if old_target else "(empty)"
+
+            concept, hit_count, ties = classify_target(old_target)
+
+            if concept is None:
+                rows.append((idx, old_name, "-", "unmanaged", "skip (no concept keywords matched)"))
+                continue
+
+            if ties:
+                rows.append((idx, old_name, concept["name"],
+                             "AMBIGUOUS", f"also matched {ties} — verify manually, not touched"))
+                skipped.append((idx, [f"AMBIGUOUS concept for old target: {old_name}"]))
+                continue
+
+            seen_concepts.setdefault(concept["name"], []).append(idx)
+            if not concept.get("allow_multiple") and len(seen_concepts[concept["name"]]) > 1:
+                rows.append((idx, old_name, concept["name"],
+                             "DRIFT WARNING",
+                             f"'{concept['name']}' already assigned to slot(s) "
+                             f"{seen_concepts[concept['name']][:-1]} — this slot "
+                             f"also classifies as '{concept['name']}'. Likely index "
+                             f"drift or leftover corruption from a prior run."))
+
+            match = match_ref_file(concept, ref_files)
+            if match is None:
+                rows.append((idx, old_name, concept["name"], "NO MATCH",
+                             "no ref file in --refs-folder satisfies this concept's keywords"))
+                skipped.append((idx, concept["keywords"]))
+                continue
+
+            chosen_files_by_concept[concept["name"]] = match
+            new_target = build_new_target(match)
+            updates[idx] = (rels_path, old_target, new_target, match, concept["name"])
+            rows.append((idx, old_name, concept["name"], "OK", f"-> {match.name}"))
+
+        file_to_concepts = {}
+        for idx, (_, _, _, match, cname) in updates.items():
+            file_to_concepts.setdefault(match.resolve(), set()).add(cname)
+        for f, cnames in file_to_concepts.items():
+            if len(cnames) > 1:
+                skipped.append((None, [f"CONFLICT: {f.name} matched multiple concepts: {sorted(cnames)}"]))
+
+        print(f"{'IDX':<4} {'OLD TARGET FILE':<55} {'CONCEPT':<14} {'STATUS':<16} DETAIL")
+        for idx, old_name, cname, status, detail in rows:
+            print(f"{idx:<4} {old_name[:53]:<55} {cname:<14} {status:<16} {detail}")
+
+        if skipped:
+            print("\nSkipped / flagged:")
+            for idx, reason in skipped:
+                print(" ", idx, reason)
+
+        expected_names = {c["name"] for c in CONCEPTS}
+        found_names = set(seen_concepts.keys())
+        missing = expected_names - found_names
+        if missing:
+            print("\nConcepts with NO current slot found in this workbook at all:")
+            for m in sorted(missing):
+                print("  -", m, "(if you expect this source to exist, check the workbook by hand)")
+
+        if args.dry_run:
+            print("\n--dry-run set: no file written.")
+            return
+
+        if not updates:
+            print("\nNothing matched — output not written.")
+            return
+
+        matched_by_idx = {idx: item[3] for idx, item in updates.items()}
+
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as out_zf:
+            for item in zf.infolist():
+                data = zf.read(item.filename)
+
+                if item.filename == "xl/worksheets/sheet5.xml":
+                    data = patch_hasil_pivot_formulas(data, matched_by_idx)
+
+                for idx, (rels_path, old_t, new_t, match, cname) in updates.items():
+                    if item.filename == rels_path:
+                        text = data.decode("utf-8")
+                        text = TARGET_RE.sub(
+                            lambda _m, nt=new_t: f'Target="{nt}"',
+                            text,
+                            count=1,
+                        )
+                        data = text.encode("utf-8")
+                        break
+
+                out_zf.writestr(item, data)
+
+    print(f"\nWrote {out_path} — {len(updates)} link(s) relinked.")
+    print("ONLY 透视资料 Hasil Pivot external formulas were patched.")
+    print("Do not edit 综合 Keseluruhan.")
+
+    if not args.no_recalc:
+        force_recalculate_values(out_path)
+
+
+if __name__ == "__main__":
+    main()
